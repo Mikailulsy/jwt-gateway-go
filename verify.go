@@ -60,6 +60,10 @@ type Verifier struct {
 	Audience string
 	Leeway   time.Duration
 	Now      func() time.Time
+	// RequiredTyp, when set (for example "at+jwt" per RFC 9068), rejects
+	// tokens whose typ header differs, so an ID token for the same audience
+	// cannot be replayed as an access token.
+	RequiredTyp string
 }
 
 var (
@@ -73,9 +77,10 @@ var (
 )
 
 type header struct {
-	Alg string `json:"alg"`
-	Kid string `json:"kid"`
-	Typ string `json:"typ"`
+	Alg  string   `json:"alg"`
+	Kid  string   `json:"kid"`
+	Typ  string   `json:"typ"`
+	Crit []string `json:"crit"`
 }
 
 func (v *Verifier) Verify(token string) (*Claims, error) {
@@ -90,7 +95,10 @@ func (v *Verifier) Verify(token string) (*Claims, error) {
 	if h.Alg != "RS256" && h.Alg != "ES256" {
 		return nil, ErrAlg // rejects "none", HS*, and everything else
 	}
-	if h.Kid == "" {
+	if h.Kid == "" || len(h.Crit) > 0 { // we understand no critical extensions
+		return nil, ErrMalformed
+	}
+	if v.RequiredTyp != "" && !strings.EqualFold(h.Typ, v.RequiredTyp) {
 		return nil, ErrMalformed
 	}
 
@@ -98,7 +106,7 @@ func (v *Verifier) Verify(token string) (*Claims, error) {
 	if err != nil {
 		return nil, fmt.Errorf("key lookup: %w", err)
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	sig, err := base64.RawURLEncoding.Strict().DecodeString(parts[2])
 	if err != nil {
 		return nil, ErrMalformed
 	}
@@ -150,7 +158,7 @@ func (v *Verifier) Verify(token string) (*Claims, error) {
 }
 
 func decodeSegment(seg string, out any) error {
-	b, err := base64.RawURLEncoding.DecodeString(seg)
+	b, err := base64.RawURLEncoding.Strict().DecodeString(seg)
 	if err != nil {
 		return err
 	}

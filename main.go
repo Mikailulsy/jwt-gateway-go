@@ -33,6 +33,8 @@ func main() {
 		Audience: audience,
 		Leeway:   30 * time.Second,
 		Now:      time.Now,
+		// Optional: set TOKEN_TYP=at+jwt to require RFC 9068 access tokens.
+		RequiredTyp: os.Getenv("TOKEN_TYP"),
 	}
 	limiter := NewRateLimit(50, 100)
 

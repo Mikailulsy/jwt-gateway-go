@@ -44,6 +44,11 @@ type KeySet struct {
 	minRefresh time.Duration
 	now        func() time.Time
 
+	// maxStale bounds how long known keys keep being served while the IdP
+	// is unreachable. Past it, verification fails closed.
+	maxStale time.Duration
+
+	refreshMu sync.Mutex // serializes fetches; never held by readers
 	mu        sync.RWMutex
 	keys      map[string]any // kid -> *rsa.PublicKey | *ecdsa.PublicKey
 	fetchedAt time.Time
@@ -56,6 +61,7 @@ func NewKeySet(url string, ttl, minRefresh time.Duration) *KeySet {
 		client:     &http.Client{Timeout: 5 * time.Second},
 		ttl:        ttl,
 		minRefresh: minRefresh,
+		maxStale:   24 * time.Hour,
 		now:        time.Now,
 		keys:       map[string]any{},
 	}
@@ -77,7 +83,10 @@ func (k *KeySet) Key(kid string) (any, error) {
 	if err := k.refresh(); err != nil {
 		// Serve a known key through a temporary IdP outage rather than
 		// failing every request; an unknown key still fails closed.
-		if ok {
+		k.mu.RLock()
+		usable := ok && k.now().Sub(k.fetchedAt) < k.ttl+k.maxStale
+		k.mu.RUnlock()
+		if usable {
 			return key, nil
 		}
 		return nil, err
@@ -92,12 +101,19 @@ func (k *KeySet) Key(kid string) (any, error) {
 }
 
 func (k *KeySet) refresh() error {
+	// Only one goroutine fetches at a time; the others wait here, but
+	// requests served from a fresh cache never touch this mutex, and the
+	// data lock is never held across the network call.
+	k.refreshMu.Lock()
+	defer k.refreshMu.Unlock()
+
 	k.mu.Lock()
-	defer k.mu.Unlock()
 	if k.now().Sub(k.lastTry) < k.minRefresh {
-		return nil // another request refreshed very recently
+		k.mu.Unlock()
+		return nil // refreshed very recently (possibly by the caller we waited on)
 	}
 	k.lastTry = k.now()
+	k.mu.Unlock()
 
 	resp, err := k.client.Get(k.url)
 	if err != nil {
@@ -130,8 +146,10 @@ func (k *KeySet) refresh() error {
 	if len(next) == 0 {
 		return errors.New("jwks contains no usable signing keys")
 	}
+	k.mu.Lock()
 	k.keys = next
 	k.fetchedAt = k.now()
+	k.mu.Unlock()
 	return nil
 }
 

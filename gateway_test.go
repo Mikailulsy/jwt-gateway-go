@@ -318,3 +318,213 @@ func TestRateLimit(t *testing.T) {
 		t.Fatal("tokens should refill over time")
 	}
 }
+
+// ---- regression tests for review findings ----
+
+func gatewayWithUpstream(t *testing.T, idp *testIdP, now time.Time) (gw *httptest.Server, seen *http.Header) {
+	t.Helper()
+	var last http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		last = r.Header.Clone()
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(upstream.Close)
+	u, _ := url.Parse(upstream.URL)
+	h := Authenticate(newVerifier(idp, now), slog.New(slog.NewTextHandler(io.Discard, nil)), NewProxy(u))
+	gw = httptest.NewServer(h)
+	t.Cleanup(gw.Close)
+	return gw, &last
+}
+
+func TestProxyCannotBeTrickedIntoDroppingOrForgingIdentity(t *testing.T) {
+	idp := newIdP(t)
+	now := time.Now()
+	gw, seen := gatewayWithUpstream(t, idp, now)
+
+	claims := good(now)
+	delete(claims, "role") // token without a role: client-supplied roles must not survive
+	token := signRS256(t, idp.rsaKey, "rsa-1", claims)
+
+	req, _ := http.NewRequest("GET", gw.URL+"/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Connection", "X-User-Id")          // hop-by-hop trick
+	req.Header["X_user_role"] = []string{"superadmin"} // underscore variant
+	req.Header.Set("X-User-Email", "ceo@corp")         // other identity-looking header
+	req.Header.Set("X-Auth-Token", "forged")
+	req.Header.Set("X-Forwarded-For", "10.0.0.1") // spoofed client IP
+	req.Header.Set("Forwarded", "for=10.0.0.1")
+	req.Header.Set("X-Forwarded-Host", "evil.test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("request failed: %v %v", err, resp)
+	}
+	h := *seen
+	if got := h.Get("X-User-Id"); got != "user-1" {
+		t.Fatalf("verified X-User-Id lost: %q", got)
+	}
+	for _, name := range []string{"X_user_role", "X-User-Role", "X-User-Email", "X-Auth-Token", "Forwarded", "Authorization"} {
+		if v := h[name]; len(v) != 0 {
+			t.Fatalf("%s reached upstream: %v", name, v)
+		}
+	}
+	if xff := h.Get("X-Forwarded-For"); xff == "10.0.0.1" || len(h.Values("X-Forwarded-For")) != 1 || xff == "" {
+		t.Fatalf("X-Forwarded-For must be replaced by the peer address, got %q", xff)
+	}
+	if h.Get("X-Forwarded-Host") == "evil.test" {
+		t.Fatal("client X-Forwarded-Host must not be trusted")
+	}
+}
+
+func TestRateLimitEvictsIdleKeysInsteadOfResetting(t *testing.T) {
+	clock := time.Now()
+	l := NewRateLimit(1, 2)
+	l.maxKeys = 3
+	l.now = func() time.Time { return clock }
+
+	l.Allow("victim")
+	l.Allow("victim")
+	if l.Allow("victim") {
+		t.Fatal("victim should be limited")
+	}
+	l.Allow("a")
+	// Table is full (victim, a, + one more). New key churn must not reset victim.
+	l.Allow("b")
+	if l.Allow("c") {
+		t.Fatal("full table with no idle buckets must deny new keys (fail closed)")
+	}
+	if l.Allow("victim") {
+		t.Fatal("churn must not wipe the victim's bucket")
+	}
+	clock = clock.Add(10 * time.Second) // everyone refills, idle buckets are evictable
+	if !l.Allow("c") {
+		t.Fatal("after idle eviction a new key should be admitted")
+	}
+}
+
+func TestClientKeyGroupsIPv6By64(t *testing.T) {
+	a := clientKey("[2001:db8:1:2::1]:5000")
+	b := clientKey("[2001:db8:1:2:ffff::9]:6000")
+	c := clientKey("[2001:db8:1:3::1]:5000")
+	if a != b {
+		t.Fatalf("same /64 must share a key: %s vs %s", a, b)
+	}
+	if a == c {
+		t.Fatal("different /64 must not share a key")
+	}
+	if clientKey("203.0.113.9:1234") != "203.0.113.9" {
+		t.Fatal("ipv4 key should be the bare address")
+	}
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	l := NewRateLimit(0.001, 2)
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	codes := []int{}
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "198.51.100.7:4444"
+		h.ServeHTTP(rec, req)
+		codes = append(codes, rec.Code)
+	}
+	if codes[0] != 200 || codes[1] != 200 || codes[2] != 429 {
+		t.Fatalf("got %v, want [200 200 429]", codes)
+	}
+}
+
+func TestSlowIdPDoesNotBlockCachedKeys(t *testing.T) {
+	idp := newIdP(t)
+	now := time.Now()
+	v := newVerifier(idp, now)
+	if _, err := v.Verify(signRS256(t, idp.rsaKey, "rsa-1", good(now))); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		_ = json.NewEncoder(w).Encode(jwks{Keys: *idp.keys.Load()})
+	}))
+	defer slow.Close()
+	defer close(release)
+	v.Keys.url = slow.URL
+
+	// An unknown kid starts a slow refresh in the background...
+	go func() { _, _ = v.Verify(signRS256(t, idp.rsaKey, "new-kid", good(now))) }()
+	time.Sleep(100 * time.Millisecond)
+
+	// ...while a request with a cached, fresh key must still be served promptly.
+	done := make(chan error, 1)
+	go func() { _, err := v.Verify(signRS256(t, idp.rsaKey, "rsa-1", good(now))); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cached-key verification was blocked behind a slow JWKS fetch")
+	}
+}
+
+func TestStaleKeysExpireDuringLongOutage(t *testing.T) {
+	idp := newIdP(t)
+	now := time.Now()
+	clock := now
+	ks := NewKeySet(idp.srv.URL, time.Minute, 0)
+	ks.maxStale = time.Hour
+	ks.now = func() time.Time { return clock }
+	v := &Verifier{Keys: ks, Issuer: "https://idp.test", Audience: "api", Now: func() time.Time { return now }}
+
+	if _, err := v.Verify(signRS256(t, idp.rsaKey, "rsa-1", good(now))); err != nil {
+		t.Fatal(err)
+	}
+	idp.srv.Close()
+	clock = clock.Add(30 * time.Minute)
+	if _, err := v.Verify(signRS256(t, idp.rsaKey, "rsa-1", good(now))); err != nil {
+		t.Fatalf("within maxStale a known key is still served: %v", err)
+	}
+	clock = clock.Add(2 * time.Hour)
+	if _, err := v.Verify(signRS256(t, idp.rsaKey, "rsa-1", good(now))); err == nil {
+		t.Fatal("beyond maxStale verification must fail closed")
+	}
+}
+
+func TestTypAndCritHeaders(t *testing.T) {
+	idp := newIdP(t)
+	now := time.Now()
+	v := newVerifier(idp, now)
+	v.RequiredTyp = "at+jwt"
+
+	mk := func(hdr map[string]any) string {
+		in := seg(hdr) + "." + seg(good(now))
+		d := sha256.Sum256([]byte(in))
+		sig, _ := rsa.SignPKCS1v15(rand.Reader, idp.rsaKey, crypto.SHA256, d[:])
+		return in + "." + b64.EncodeToString(sig)
+	}
+	if _, err := v.Verify(mk(map[string]any{"alg": "RS256", "kid": "rsa-1", "typ": "at+jwt"})); err != nil {
+		t.Fatalf("at+jwt should pass: %v", err)
+	}
+	if _, err := v.Verify(mk(map[string]any{"alg": "RS256", "kid": "rsa-1", "typ": "JWT"})); err == nil {
+		t.Fatal("wrong typ must be rejected when RequiredTyp is set")
+	}
+	v.RequiredTyp = ""
+	if _, err := v.Verify(mk(map[string]any{"alg": "RS256", "kid": "rsa-1", "crit": []string{"exp"}})); err == nil {
+		t.Fatal("tokens with crit extensions must be rejected")
+	}
+}
+
+func TestStrictBase64RejectsNonCanonicalSignature(t *testing.T) {
+	idp := newIdP(t)
+	now := time.Now()
+	v := newVerifier(idp, now)
+	tok := signRS256(t, idp.rsaKey, "rsa-1", good(now))
+	// 256-byte RSA signatures encode to 342 chars; the last char carries 4 unused bits.
+	last := tok[len(tok)-1]
+	alt := byte('A')
+	if last == 'A' {
+		alt = 'B'
+	}
+	if _, err := v.Verify(tok[:len(tok)-1] + string(alt)); err == nil {
+		t.Fatal("non-canonical base64 must be rejected")
+	}
+}
